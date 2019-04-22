@@ -1,57 +1,56 @@
 package org.apache.spark.examples
 
 import scala.io.Source
+import scala.collection.Iterator
+import scala.collection.JavaConverters._
 
 import org.apache.spark.rdd.RDD
-import org.apache.spark.sql.SparkSession
+import org.apache.spark.{SparkConf, SparkContext}
+import org.apache.spark.broadcast.Broadcast
+import org.apache.spark.internal.Logging
+import org.apache.spark.streaming.{Duration, Time}
 
 import java.util.concurrent.{Executors, LinkedBlockingQueue}
 import java.util.concurrent.ThreadLocalRandom
-import java.util.Arrays
-import java.util.Iterator
-import java.util.List
 
 class StreamingWordCount {
 
   case class SentenceEvent(timeStamp: Long, sentence: String)
   case class WordRecord(timeStamp: Long, word: String, count: Int)
+  type OutputRDD = RDD[(String, Long)]
 
-  class Generator(sourcePath : String, batchSize: Int) {
+  class Generator(sourcePath: String,
+                  batchSize: Int,
+                  queue: LinkedBlockingQueue[Array[OutputRDD]]) {
 
     var tpool = Executors.newFixedThreadPool(1)
     var source = Source.fromFile(sourcePath)
-    // lazy iterator returning batches, -1 to represent no timestamp
-    var lines = source.getLines.grouped(batchSize) 
+    var rddQueue = queue
+    // lazy iterator returning batches
+    var lines = source.getLines.grouped(batchSize)
 
-    def start(sc : SparkContext, 
-              numRecords: Int,
+    def start(sc: SparkContext,
               groupSize: Int,
+              numMicroBatches: Int,
+              numPartitions: Int,
               numReducers: Int,
               targetThroughput: Int) {
       val generatorThread = new Runnable {
         override def run() {
-          // Initialize state RDD (guessing this chaining is necessary for FT)
-          var stateRdd: RDD[(long, String, long)] = sc.parallelize(0 until numReducers, numReducers).mapPartitions(_ => Iterator())
+          var stateRdd: OutputRDD = sc.parallelize(0 until numReducers, numReducers).mapPartitions(_ => Iterator())
           // Divide batchSize by groupSize?
-          val numRecordsSeen = 0
-          //val microBatchTimeSlice = batchSize / targetThroughput
-          val recordTimestamp = System.currentTimeMillis
-          (0 until numIterations by groupSize).map { i =>
-            // Generate a group (Array[RDD])
-            val thisGroup = (0 until groupSize).map { g => 
-              recordTimeStamp += microBatchTimeSlice
-              stateRdd = generateRDD(sc, recordTimeStamp, numReducers, targetThroughput)
+          val microBatchTimeSlice = batchSize / targetThroughput
+          var recordTimeStamp = System.currentTimeMillis
+          (0 until numMicroBatches by groupSize).map { i =>
+            // Generate a drizzle group
+            recordTimeStamp += microBatchTimeSlice
+            val thisGroup = (0 until groupSize).map { g =>
+              stateRdd = generateRDD(sc, recordTimeStamp, numPartitions, numReducers, targetThroughput)
               // TODO possibly checkpoint RDD
               stateRdd
             }.toArray
-            recordTimestamp += microBatchTimeSlice 
             // Enqueue for processing
-            log.info("Added group " + i)
             rddQueue.put(thisGroup)
-            numRecordsSeen += (batchSize * groupSize) // TODO fix
-            if (numRecordsSeen >= numRecords) {
-              return
-            }
           }
         }
       }
@@ -64,27 +63,25 @@ class StreamingWordCount {
     }
 
     // TODO see how zipWithIndex().map() compares to iterating over list manually
-    def generateRDD(sc: SparkContext, 
-                    recordTimeStamp: long, 
+    def generateRDD(sc: SparkContext,
+                    recordTimeStamp: Long,
+                    numPartitions: Int,
                     numReducers: Int,
-                    targetThroughput: Int) {
+                    targetThroughput: Int) : OutputRDD = {
       // Generate batches
       val dataRdd = sc.parallelize(0 until numPartitions, numPartitions).mapPartitions { _ =>
-        val linesBatch = lines.next().zipWithIndex.map { case (line, index) => 
-         if (index == 0) Event(recordTimeStamp, line) else Event(-1, line) 
-        }
+        val linesBatch = lines.next().zipWithIndex.map { case (line, index) =>
+         if (index == 0) SentenceEvent(recordTimeStamp, line) else SentenceEvent(-1, line)
+        }.iterator
         linesBatch
       }
-      // Wait until time slice complete
+      // Wait until time slice completes
       val dataReadyRdd = dataRdd.mapPartitions { iter =>
         if (iter.hasNext) {
+          // Start processing after we are at T as that is the time we generate data until
           val curTime = System.currentTimeMillis
-          // Start processing after we are at T + B
-          // as that is the time we generate data until
-          val targetTime = recordTimeStamp + microBatchTimeSliceInMs
-          if (curTime < targetTime) {
-            log.debug("Sleeping for " + remaining + " ms")
-            Thread.sleep(targetTime - curTime)
+          if (curTime < recordTimeStamp) {
+            Thread.sleep(recordTimeStamp - curTime)
           }
           iter
         } else {
@@ -92,9 +89,9 @@ class StreamingWordCount {
         }
       }
       // Process words (TODO fix, reduceByKey without ts)
-      val counts = dataReadyRdd.flatMap { event => 
+      val counts = dataReadyRdd.flatMap { event =>
         val words = event.sentence.split(" ")
-        val wordsWithTSandCounts = words.map.zipWithIndex { case (word, index) => 
+        val wordsWithTSandCounts = words.map.zipWithIndex { case (word: String, index) =>
           if (index == 0) WordRecord(event.timeStamp, word, 1) else WordRecord(1, word, 1)
         }
         wordsWithTSandCounts
@@ -110,21 +107,20 @@ class StreamingWordCount {
     }
   }
 
-  def processStream(sc : SparkContext, 
-                    batchRDDs : LinkedBlockingQueue[Array[RDD[(long, String, long)]]], 
-                    numItersInBatch : Int, 
-                    groupSize : Int): Unit = {
-      (0 until numItersInBatch by groupSize).map { x =>
-        // Blocking for group x
-        val batch = batchRDDs.take()
-        // Picked up group x
-        val funcs = Seq.fill(batch.length)(pairCollectFunc) // TODO define func
-        long current = System.currentTimeMillis
-        val results = sc.runJobs(batch, funcs)
-        println("Round takes " + (System.currentTimeMillis() - current))
-        results.foreach { result =>
-          println(result.flatten.mkString("Latency: [", ":", "]"))
-        }
+  def processStream(sc: SparkContext,
+                    batchRDDs: LinkedBlockingQueue[Array[OutputRDD]],
+                    numMicroBatches: Int,
+                    groupSize: Int): Unit = {
+    (0 until numMicroBatches by groupSize).map { x =>
+      // Blocking for group x
+      val batch = batchRDDs.take()
+      // Picked up group x
+      val funcs = Seq.fill(batch.length)(pairCollectFunc) // TODO define func
+      val current = System.currentTimeMillis
+      val results = sc.runJobs(batch, funcs)
+      println("Round takes " + (System.currentTimeMillis() - current))
+      results.foreach { result =>
+        println(result.flatten.mkString("Latency: [", ":", "]"))
       }
     }
   }
@@ -132,25 +128,26 @@ class StreamingWordCount {
   def main(args : Array[String]) {
 
     // TODO add correct params
-    if (args.length < 5) {
-      println("Usage: StreamingWordCount [words_file] [checkpoint_path] [batch_size] [group_size] [num_reducers] [target_throughput]")
+    if (args.length < 7) {
+      println("Usage: StreamingWordCount [words_file] [checkpoint_path] [batch_size] [group_size] [num_microbatches] [num_partitions] [num_reducers] [target_throughput]")
       System.exit(1)
     }
 
-    val wordsFilePath = args[0]
-    val checkpointPath = args[1]
-    val batchSize = args[2]
-    val groupSize = args[3]
-    val numReducers = args[4]
-    val targetThroughput = args[5]
-    // num mappers?
+    val wordsFilePath = args(0)
+    val checkpointPath = args(1)
+    val batchSize = args(2).toInt
+    val groupSize = args(3).toInt
+    val numMicroBatches = args(4).toInt // stopping condition
+    val numPartitions = args(5).toInt
+    val numReducers = args(6).toInt
+    val targetThroughput = args(7).toInt
 
-    val sparkConf = SparkConf().setAppName("StreamingWordCount")
-    val sc = SparkContext(sparkConf)
+    val sparkConf = new SparkConf().setAppName("StreamingWordCount")
+    val sc = new SparkContext(sparkConf)
     sc.setCheckpointDir(checkpointPath)
 
     // Let all the executors join
-    Thread.sleep(1000)
+    Thread.sleep(2000)
 
     // Warmup JVM
     for (i <- 1 to 20) {
@@ -160,9 +157,10 @@ class StreamingWordCount {
     }
 
     // Generate and process stream
-    val generator = Generator(wordsFilePath, batchSize)
-    generator.start(sc, numRecords, groupSize, numReducers, targetThroughput)
-    processStream(sc)
+    val rddQueue = new LinkedBlockingQueue[Array[OutputRDD]]
+    val generator = new Generator(wordsFilePath, batchSize, rddQueue)
+    generator.start(sc, groupSize, numMicroBatches, numPartitions, numReducers, targetThroughput)
+    processStream(sc, rddQueue, numMicroBatches, groupSize)
     generator.stop()
     sc.stop()
   }
