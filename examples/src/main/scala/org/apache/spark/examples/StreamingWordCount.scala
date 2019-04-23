@@ -93,18 +93,6 @@ object StreamingWordCount {
       source.close()
     }
 
-    /**
-     * Get [[this.batchSize]] sentences
-     */
-    def getSentences() : Iterator[(Int, String)] = {
-      // use lines.next() if using pre-grouped lines, else...
-      val sentences = (0 until batchSize).map { i =>
-        val idx = r.nextInt(wordsSource.size - SentenceLength)
-        (i, wordsSource.slice(idx, idx + SentenceLength).mkString(" "))
-      }
-      sentences.iterator
-    }
-
     def generateRDD(stateRdd: OutputRDD,
                     recordTimeStamp: Long,
                     numPartitions: Int,
@@ -112,14 +100,21 @@ object StreamingWordCount {
                     targetThroughput: Int) : OutputRDD = {
       val sc = stateRdd.context
 
+      val batchSizeLocal = batchSize
+      val wordsSourceLocal = wordsSource
+      val wordsSourceSizeLocal = wordsSourceLocal.size
+      val sentenceLengthLocal = SentenceLength
+      val rLocal = r
+
       // ----------------
       // Generate batches
       // ----------------
       val dataRdd = sc.parallelize(0 until numPartitions, numPartitions).mapPartitions { _ =>
-        val linesBatch = getSentences.map { case (index, line) =>
-          log.debug("Line: " + line)
-          if (index == 0) SentenceEvent(recordTimeStamp, line) else SentenceEvent(-1, line)
-        }
+        val linesBatch = (0 until batchSizeLocal).map { i =>
+          val idx = rLocal.nextInt(wordsSourceSizeLocal - sentenceLengthLocal)
+          val line = wordsSourceLocal.slice(idx, idx + sentenceLengthLocal).mkString(" ")
+          if (i == 0) SentenceEvent(recordTimeStamp, line) else SentenceEvent(-1, line)
+        }.iterator
         linesBatch
       }
 
@@ -144,6 +139,7 @@ object StreamingWordCount {
       val countsRdd = dataReadyRdd.flatMap { event =>
         val words = event.sentence.split(" ")
         val wordsWithTSandCounts = words.zipWithIndex.map { case (word: String, index) =>
+          // Only pass the timestamp to a single word of the sentence
           if (index == 0) WordRecord(event.timeStamp, word, 1) else WordRecord(-1, word, 1)
         }
         wordsWithTSandCounts
@@ -175,7 +171,6 @@ object StreamingWordCount {
           if (wordRecord.timeStamp != -1) {
             val lat = System.currentTimeMillis - wordRecord.timeStamp
             // TODO: write to file
-            log.debug(lat.toString)
           }
         }
 
