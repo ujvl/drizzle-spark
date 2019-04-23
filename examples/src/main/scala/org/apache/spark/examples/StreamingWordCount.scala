@@ -40,8 +40,8 @@ import org.apache.spark.streaming.{Duration, Time}
 object StreamingWordCount {
 
   case class SentenceEvent(timeStamp: Long, sentence: String)
-  case class WordRecord(timeStamp: Long, word: String, count: Int)
-  type OutputRDD = RDD[(String, Long)]
+  type WordRecord = (String, (Int, Long))
+  type OutputRDD = RDD[(String, (Int, Long))]
 
   class Generator(sourcePath: String,
                   queue: LinkedBlockingQueue[Array[OutputRDD]]) {
@@ -81,7 +81,7 @@ object StreamingWordCount {
               recordTimeStamp += microBatchTimeSlice
               // Generate a drizzle group
               stateRdd = generateRDD(stateRdd, wordsSourceBCVar, recordTimeStamp,
-                                     batchSize, numPartitions, numReducers, targetThroughput)
+                                     batchSize, numPartitions, numReducers)
               if (false) {
                 // TODO define checkpoint condition
                 stateRdd.checkpoint()
@@ -106,8 +106,7 @@ object StreamingWordCount {
                     recordTimeStamp: Long,
                     batchSize: Int,
                     numPartitions: Int,
-                    numReducers: Int,
-                    targetThroughput: Int) : OutputRDD = {
+                    numReducers: Int) : OutputRDD = {
       val sc = stateRdd.context
       // For some reason need to make copies of variables in local
       // scope for the variables to be usable by spark jobs.
@@ -149,58 +148,47 @@ object StreamingWordCount {
         val wordsWithTSandCounts = words.zipWithIndex.map {
           case (word: String, index) =>
           // Only pass the timestamp to a single word of the sentence
-          if (index == 0) {
-            WordRecord(event.timeStamp, word, 1)
-          }
-          else {
-            WordRecord(-1, word, 1)
-          }
+          // type: (word, (count, ts))
+          if (index == 0) (word, (1, event.timeStamp)) else (word, (1, -1.toLong))
         }
         wordsWithTSandCounts
       }
 
       // Repartition for reduce step (zipPartitions)
       // coalesce assumes numReducers < numMappers
-      val repartitionedCountsRdd = countsRdd.coalesce(numReducers)
+      // val repartitionedCountsRdd = countsRdd.coalesce(numReducers)
 
       // -----------------------------------------------------------
       // Reduce word counts of current batch along with state so far
       // -----------------------------------------------------------
-      val newStateRdd = countsRdd.zipPartitions(stateRdd) {
+      val reducedRdd = countsRdd.reduceByKey(
+        (a: (Int, Long), b: (Int, Long)) => (a._1 + b._1, a._2.max(b._2)),
+        numReducers
+      ) 
+      val newStateRdd = reducedRdd.zipPartitions(stateRdd) {
         case (iterNew, iterOld) =>
-        // hacky way to write out latencies
-        val writer = new BufferedWriter(
-          new FileWriter("/home/ubuntu/drizzle-spark/log.txt", true))
 
-        var timestamps = new ArrayBuffer[Long]()
-        val countsMap = new HashMap[String, Long]
+        val countsMap = new HashMap[String, (Int, Long)]
 
-        iterOld.foreach { case (word, count) =>
-          countsMap.put(word, count)
+        iterOld.foreach { case (word, countAndTs) =>
+
+          countsMap.put(word, (countAndTs._1, -1))
         }
-        iterNew.foreach { wordRecord =>
-          val word = wordRecord.word
-          val count = wordRecord.count
+        iterNew.foreach { case (word, countAndTs) =>
+          val count = countAndTs._1
+          val ts = countAndTs._2
+
           if (countsMap.containsKey(word)) {
-            countsMap.put(word, count + countsMap.get(word))
+            val tsCountTup = countsMap.get(word)
+            val newCount = count + tsCountTup._1
+            val maxTs = ts.max(tsCountTup._2)
+            countsMap.put(word, (newCount, maxTs))
           }
           else {
-            countsMap.put(word, count)
-          }
-
-          if (wordRecord.timeStamp != -1) {
-            timestamps += wordRecord.timeStamp
+            countsMap.put(word, (count, ts))
           }
 
         }
-
-        timestamps.foreach { ts =>
-          val now = System.currentTimeMillis
-          val lat = now - ts
-          writer.append(lat.toString + "\n")
-        }
-
-        writer.close
 
         countsMap.asScala.iterator
       }
@@ -210,8 +198,12 @@ object StreamingWordCount {
     }
   }
 
-  val pairCollectFunc = (iter: Iterator[(String, Long)]) => {
-    iter.map(p => (p._1, p._2)).toArray
+  val pairCollectFunc = (iter: Iterator[(String, (Int, Long))]) => {
+    val now = System.currentTimeMillis
+    iter.map { p =>
+      val lat = if (p._2._2 != -1) now - p._2._2 else -1
+      (p._1, p._2._1, lat)
+    }.toArray
   }
 
   def processStream(sc: SparkContext,
@@ -224,8 +216,26 @@ object StreamingWordCount {
       // Picked up group x
       val funcs = Seq.fill(batch.length)(pairCollectFunc)
       val current = System.currentTimeMillis
-      val results = sc.runJobs(batch, funcs)
-      println("Round takes " + (System.currentTimeMillis - current))
+
+      if (groupSize == 1) {
+        val results = sc.runJob(batch(0), pairCollectFunc)
+        results.foreach { tups: Array[(String, Int, Long)] =>
+          tups.foreach { tup =>
+            if (tup._3 != -1)
+              println(tup._3.toString)
+          }
+        }
+      } else {
+        val results = sc.runJobs(batch, funcs)
+        results.foreach { in: Array[Array[(String, Int, Long)]] =>
+          in.foreach { tups =>
+            tups.foreach { tup =>
+              if (tup._3 != -1)
+                println(tup._3.toString)
+            }
+          }
+        }
+      }
     }
   }
 
