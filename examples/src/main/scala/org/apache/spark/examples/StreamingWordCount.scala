@@ -25,6 +25,7 @@ import java.util.concurrent.{Executors, LinkedBlockingQueue, ThreadLocalRandom}
 import scala.collection.Iterator
 import scala.collection.JavaConverters._
 import scala.collection.mutable.ArrayBuffer
+import scala.collection.mutable.ListBuffer
 import scala.io.Source
 import scala.util.Random
 
@@ -40,8 +41,9 @@ import org.apache.spark.streaming.{Duration, Time}
 object StreamingWordCount {
 
   case class SentenceEvent(timeStamp: Long, sentence: String)
-  type WordRecord = (String, (Int, Long))
-  type OutputRDD = RDD[(String, (Int, Long))]
+  type CountTSPair = (Int, Long)
+  type WordRecord = (String, CountTSPair)
+  type OutputRDD = RDD[(String, CountTSPair)]
 
   class Generator(sourcePath: String,
                   queue: LinkedBlockingQueue[Array[OutputRDD]]) {
@@ -53,7 +55,6 @@ object StreamingWordCount {
     source.close()
     var rddQueue = queue
 
-    val r = scala.util.Random
     var tpool = Executors.newFixedThreadPool(1)
 
     def start(sc: SparkContext,
@@ -82,14 +83,12 @@ object StreamingWordCount {
               // Generate a drizzle group
               stateRdd = generateRDD(stateRdd, wordsSourceBCVar, recordTimeStamp,
                                      batchSize, numPartitions, numReducers)
-              if (false) {
-                // TODO define checkpoint condition
+              if ((iteration % groupSize) == (groupSize - 1)) {
                 stateRdd.checkpoint()
               }
               stateRdd
             }.toArray
             // Enqueue for processing
-            println("Generated group " + i)
             rddQueue.put(thisGroup)
           }
         }
@@ -108,10 +107,6 @@ object StreamingWordCount {
                     numPartitions: Int,
                     numReducers: Int) : OutputRDD = {
       val sc = stateRdd.context
-      // For some reason need to make copies of variables in local
-      // scope for the variables to be usable by spark jobs.
-      val sentenceLengthLocal = SentenceLength
-      val rLocal = r
 
       // ----------------
       // Generate batches
@@ -120,8 +115,9 @@ object StreamingWordCount {
                       .mapPartitions { _ =>
         val linesBatch = (0 until batchSize).map { i =>
           val words = wordsSourceBCVar.value
-          val idx = rLocal.nextInt(words.size - sentenceLengthLocal)
-          val line = words.slice(idx, idx + sentenceLengthLocal).mkString(" ")
+          val sentenceLength = 100
+          val idx = ThreadLocalRandom.current.nextInt(words.size - sentenceLength)
+          val line = words.slice(idx, idx + sentenceLength).mkString(" ")
           if (i == 0) {
             SentenceEvent(recordTimeStamp, line)
           } else {
@@ -154,55 +150,39 @@ object StreamingWordCount {
         wordsWithTSandCounts
       }
 
-      // Repartition for reduce step (zipPartitions)
-      // coalesce assumes numReducers < numMappers
-      // val repartitionedCountsRdd = countsRdd.coalesce(numReducers)
-
       // -----------------------------------------------------------
       // Reduce word counts of current batch along with state so far
       // -----------------------------------------------------------
       val reducedRdd = countsRdd.reduceByKey(
-        (a: (Int, Long), b: (Int, Long)) => (a._1 + b._1, a._2.max(b._2)),
+        (a: CountTSPair, b: CountTSPair) => (a._1 + b._1, a._2.max(b._2)),
         numReducers
-      ) 
+      )
       val newStateRdd = reducedRdd.zipPartitions(stateRdd) {
         case (iterNew, iterOld) =>
-
-        val countsMap = new HashMap[String, (Int, Long)]
-
-        iterOld.foreach { case (word, countAndTs) =>
-
-          countsMap.put(word, (countAndTs._1, -1))
-        }
+        val countsMap = new HashMap[String, CountTSPair]
         iterNew.foreach { case (word, countAndTs) =>
-          val count = countAndTs._1
-          val ts = countAndTs._2
-
-          if (countsMap.containsKey(word)) {
-            val tsCountTup = countsMap.get(word)
-            val newCount = count + tsCountTup._1
-            val maxTs = ts.max(tsCountTup._2)
-            countsMap.put(word, (newCount, maxTs))
-          }
-          else {
-            countsMap.put(word, (count, ts))
-          }
-
+          countsMap.put(word, countAndTs)
         }
-
+        iterOld.foreach { case (word, countAndTs) =>
+          if (countsMap.containsKey(word)) {
+            val curTup = countsMap.get(word)
+            countsMap.put(word, (countAndTs._1 + curTup._1, curTup._2))
+          }
+        }
         countsMap.asScala.iterator
       }
-      newStateRdd.cache()
 
+      newStateRdd.cache()
       return newStateRdd
     }
   }
 
-  val pairCollectFunc = (iter: Iterator[(String, (Int, Long))]) => {
+  val pairCollectFunc = (iter: Iterator[(String, CountTSPair)]) => {
     val now = System.currentTimeMillis
     iter.map { p =>
       val lat = if (p._2._2 != -1) now - p._2._2 else -1
-      (p._1, p._2._1, lat)
+      (p._1, p._2._1, p._2._2, lat)
+      // word, count, ts, latency
     }.toArray
   }
 
@@ -210,6 +190,7 @@ object StreamingWordCount {
                     batchRDDs: LinkedBlockingQueue[Array[OutputRDD]],
                     numMicroBatches: Int,
                     groupSize: Int): Unit = {
+    val latencies = new ListBuffer[(Long, Long)]()
     (0 until numMicroBatches by groupSize).map { x =>
       // Blocking for group x
       val batch = batchRDDs.take()
@@ -218,8 +199,8 @@ object StreamingWordCount {
       val current = System.currentTimeMillis
 
       if (groupSize == 1) {
-        val results = sc.runJob(batch(0), pairCollectFunc)
-        results.foreach { tups: Array[(String, Int, Long)] =>
+        val results = sc.runJob(batch(1), pairCollectFunc)
+        results.foreach { tups: Array[(String, Int, Long, Long)] =>
           tups.foreach { tup =>
             if (tup._3 != -1)
               println(tup._3.toString)
@@ -227,15 +208,26 @@ object StreamingWordCount {
         }
       } else {
         val results = sc.runJobs(batch, funcs)
-        results.foreach { in: Array[Array[(String, Int, Long)]] =>
+        results.foreach { in: Array[Array[(String, Int, Long, Long)]] =>
           in.foreach { tups =>
             tups.foreach { tup =>
-              if (tup._3 != -1)
-                println(tup._3.toString)
+              // 1 measurement per batch currently
+              if (tup._4 != -1) {
+                //println(
+                //  tup._1.toString 
+                //  + "," + tup._2.toString 
+                //  + "," + tup._3.toString
+                //)
+                latencies += ((tup._3, tup._4))
+              }
             }
           }
         }
       }
+    }
+
+    latencies.foreach { l =>
+      println(l)
     }
   }
 
