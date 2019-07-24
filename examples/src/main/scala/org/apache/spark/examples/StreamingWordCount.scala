@@ -167,6 +167,8 @@ object StreamingWordCount {
           if (countsMap.containsKey(word)) {
             val curTup = countsMap.get(word)
             countsMap.put(word, (countAndTs._1 + curTup._1, curTup._2))
+          } else {
+            countsMap.put(word, countAndTs)
           }
         }
         countsMap.asScala.iterator
@@ -190,7 +192,8 @@ object StreamingWordCount {
                     batchRDDs: LinkedBlockingQueue[Array[OutputRDD]],
                     numMicroBatches: Int,
                     groupSize: Int): Unit = {
-    val latencies = new ListBuffer[(Long, Long)]()
+    val latencies = new ListBuffer[String]()
+    var start_ts = -1 : Long
     (0 until numMicroBatches by groupSize).map { x =>
       // Blocking for group x
       val batch = batchRDDs.take()
@@ -207,18 +210,22 @@ object StreamingWordCount {
           }
         }
       } else {
+        val cur = System.currentTimeMillis()
         val results = sc.runJobs(batch, funcs)
+        println("Round takes " + (System.currentTimeMillis() - cur))
+        //println("Group " + x.toString)
         results.foreach { in: Array[Array[(String, Int, Long, Long)]] =>
           in.foreach { tups =>
             tups.foreach { tup =>
               // 1 measurement per batch currently
               if (tup._4 != -1) {
-                //println(
-                //  tup._1.toString 
-                //  + "," + tup._2.toString 
-                //  + "," + tup._3.toString
-                //)
-                latencies += ((tup._3, tup._4))
+                if (start_ts == -1) {
+                  start_ts = tup._3
+                }
+                val time_since_start = tup._3 - start_ts
+                val output_row = time_since_start + ", " + tup._4 + ", " + tup._1 + ", " + tup._2
+                latencies += output_row
+                //println(output_row)
               }
             }
           }
