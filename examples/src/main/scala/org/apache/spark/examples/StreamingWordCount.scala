@@ -182,9 +182,10 @@ object StreamingWordCount {
   val pairCollectFunc = (iter: Iterator[(String, CountTSPair)]) => {
     val now = System.currentTimeMillis
     iter.map { p =>
-      val lat = if (p._2._2 != -1) now - p._2._2 else -1
-      (p._1, p._2._1, p._2._2, lat)
-      // word, count, ts, latency
+      // word, count, ts
+      (p._1, p._2._1, p._2._2)
+      //  val lat = if (p._2._2 != -1) now - p._2._2 else -1
+      //  (p._1, p._2._1, p._2._2, lat)
     }.toArray
   }
 
@@ -194,38 +195,41 @@ object StreamingWordCount {
                     groupSize: Int): Unit = {
     val latencies = new ListBuffer[String]()
     var start_ts = -1 : Long
+
     (0 until numMicroBatches by groupSize).map { x =>
       // Blocking for group x
       val batch = batchRDDs.take()
       // Picked up group x
       val funcs = Seq.fill(batch.length)(pairCollectFunc)
-      val current = System.currentTimeMillis
 
       if (groupSize == 1) {
         val results = sc.runJob(batch(1), pairCollectFunc)
-        results.foreach { tups: Array[(String, Int, Long, Long)] =>
+        results.foreach { tups: Array[(String, Int, Long)] =>
           tups.foreach { tup =>
             if (tup._3 != -1)
+              // TODO fix
               println(tup._3.toString)
           }
         }
-      } else {
-        val cur = System.currentTimeMillis()
+      }
+      else {
+        val start = System.currentTimeMillis()
         val results = sc.runJobs(batch, funcs)
-        println("Round takes " + (System.currentTimeMillis() - cur))
-        //println("Group " + x.toString)
-        results.foreach { in: Array[Array[(String, Int, Long, Long)]] =>
+        val stop = System.currentTimeMillis()
+
+        results.foreach { in: Array[Array[(String, Int, Long)]] =>
           in.foreach { tups =>
             tups.foreach { tup =>
-              // 1 measurement per batch currently
-              if (tup._4 != -1) {
+              // 1 measurement per partition currently
+              if (tup._3 != -1) {
                 if (start_ts == -1) {
                   start_ts = tup._3
                 }
                 val time_since_start = tup._3 - start_ts
-                val output_row = time_since_start + ", " + tup._4 + ", " + tup._1 + ", " + tup._2
+                val lat = stop - tup._3
+                val output_row = time_since_start + ", " + lat
                 latencies += output_row
-                //println(output_row)
+                // println(output_row)
               }
             }
           }
@@ -233,9 +237,7 @@ object StreamingWordCount {
       }
     }
 
-    latencies.foreach { l =>
-      println(l)
-    }
+    latencies.foreach { println }
   }
 
   def main(args : Array[String]) {
